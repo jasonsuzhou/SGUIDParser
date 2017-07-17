@@ -349,4 +349,10 @@ public class XMLUtil {
 			}
 		}
 	}
+	
+	public static void main(String[] args) throws Exception {
+		String filePath = "d:\\doc\\FlowTaskParameterSeedSD13.xml";
+		xmlFileToDom(filePath);
+		System.out.println("OK");
+	}
 }

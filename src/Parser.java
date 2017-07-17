@@ -6,6 +6,7 @@ import java.io.FileReader;
 import java.io.FileWriter;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -13,16 +14,21 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import org.dom4j.Attribute;
 import org.dom4j.Document;
 import org.dom4j.Element;
 import org.dom4j.Node;
+import org.dom4j.io.OutputFormat;
 import org.dom4j.io.SAXReader;
 import org.dom4j.io.XMLWriter;
 
 
 public class Parser {
+	
+	public static final String NEW_LINE = "\r\n";
 	
 	private static Map<String, SeedDataBean> hmMap = new HashMap<String, SeedDataBean>();
 	private static Map<String, SeedDataBean> sguidMap = new HashMap<String, SeedDataBean>();
@@ -34,6 +40,9 @@ public class Parser {
 	private static Map<String, Map<String, String>> hmSource = new HashMap<String, Map<String, String>>();
 	private static Map<String, Map<String, String>> hmTarget = new HashMap<String, Map<String, String>>();
 	private static List<String> ignoreList = new ArrayList<String>();
+	private static ExecutorService es = Executors.newFixedThreadPool(10);
+	
+	
 	static {
 		ignoreList.add("CreatedBy");
 		ignoreList.add("CreationDate");
@@ -74,17 +83,81 @@ public class Parser {
 			compareSourceAndTarget();
 			return;
 		}
+		if ("comparesguid".equals(func)) {
+			String fileList = args[1];
+			boolean allowNullInSource = false;
+			boolean allowNullInTarget = false;
+			String allow = null;
+			if (args.length > 2) {
+				allow = args[2];
+			}
+			if ("allownull-source".equals(allow)) {
+				allowNullInSource = true;
+			} 
+			if ("allownull-target".equals(allow)) {
+				allowNullInTarget = true;
+			}
+			final boolean allowSource = allowNullInSource;
+			final boolean allowTarget = allowNullInTarget;
+			FileReader reader = new FileReader(fileList);
+            BufferedReader br = new BufferedReader(reader);
+            String str = null;
+            while((str = br.readLine()) != null) {
+            	final String line = str;
+            	es.execute(new Runnable() {
+					
+					@Override
+					public void run() {
+						String[] list = line.split(",");
+		            	final String sourceFile = list[0];
+		            	final String targetFile = list[1];
+		            	StringBuffer sb = new StringBuffer(1024);
+		    			try {
+		    				Map<String, Map<String, String>> hmSource = new HashMap<String, Map<String, String>>();
+		    				Map<String, Map<String, String>> hmTarget = new HashMap<String, Map<String, String>>();
+							loadSourceFile(sourceFile, hmSource);
+							loadTargetFile(targetFile, hmTarget);
+							compareSourceAndTargetSGUID(sb, allowSource, allowTarget, hmSource, hmTarget);
+			    			if (sb.length() > 0) {
+			    				System.out.println("==============================================================================");
+			    				System.out.println("======source file::"+sourceFile);
+			    				System.out.println("======target file::"+targetFile);
+			    				System.out.println("==============================================================================");
+			    				System.out.println(sb.toString());
+			    			}
+						} catch (Exception e) {
+							e.printStackTrace();
+						}
+					}
+				});
+            	
+            }
+            br.close();
+            reader.close();
+            es.shutdown();
+			return;
+		}
 		if ("copysguid".equals(func)) {
 			String fromFile = args[1];
 			String toFile = args[2];
+			boolean needEscape = true;
+			if (args.length > 3) {
+				if (args[3].startsWith("--noescape")) {
+					needEscape = false;
+				}
+			}
 			Map<String, List<String>> ignoreConfig = new HashMap<String, List<String>>();
 			if (args.length > 3) {
 				if (args[3].startsWith("--valuesetmatch")) {
 					needCompareValueSet = true;
 				} else {
-					String ignoreFile = args[3];
-					ignoreConfig = loadMappingFile(ignoreFile);
+					//String ignoreFile = args[3];
+					//ignoreConfig = loadMappingFile(ignoreFile);
 				}
+			}
+			if (args.length > 4) {
+				String ignoreFile = args[4];
+				ignoreConfig = loadMappingFile(ignoreFile);
 			}
 			System.out.println("==============================================================================");
 			System.out.println("======from file::" + fromFile);
@@ -94,12 +167,17 @@ public class Parser {
 			ignoreColumnList.addAll(ignoreList);
 			ignoreColumnList.add("SGUID");
 			loadFromFile(fromFile, ignoreColumnList, ignoreConfig);
-			copySGUID(toFile, ignoreConfig, ignoreColumnList);
+			copySGUID(toFile, ignoreConfig, ignoreColumnList, needEscape);
 			reformatResultFile(toFile, toFile+".new");
 			System.out.println("====================================SUMMARY====================================");
 			System.out.println("======SGUID populate to R13::"+moved);
-			System.out.println("======Missing R13::"+r13missing);
+			System.out.println("======SourceRowKeyMissingInTarget::"+r13missing);
 			System.out.println("==============================================================================");
+		}
+		if ("fixnullsguid".equals(func)) {
+			String fileName = args[1];
+			String dburl = args[2];
+			FixNullSGUIDTask.processTask(fileName, dburl);
 		}
 		
 	}
@@ -151,7 +229,7 @@ public class Parser {
 		return map;
 	}
 	
-	private static void copySGUID(String toFile, Map<String, List<String>> ignoreConfig, List<String> ignoreColumnList) throws Exception {
+	private static void copySGUID(String toFile, Map<String, List<String>> ignoreConfig, List<String> ignoreColumnList, boolean needEscape) throws Exception {
 		SAXReader reader = new SAXReader();
 		Map<String, String> map = new HashMap<String, String>();  
 		map.put("ns","http://www.oracle.com/apps/fnd/applseed");
@@ -181,7 +259,7 @@ public class Parser {
 						String sguid = xpathMap.get(newXPath);
 						Node node = doc.selectSingleNode(xPath);
 						if (node != null) {
-							System.out.println("[Existing]"+oriXPath);
+							System.out.println("[SourceExistInTarget]"+oriXPath);
 							moved++;
 							Element sguidNode = XMLUtil.findChildNode("SGUID", node);
 							if (sguidNode != null) {
@@ -189,15 +267,20 @@ public class Parser {
 								if (isNullAttr != null) {
 									sguidNode.remove(isNullAttr);
 								}
-								sguidNode.setText(sguid);
+								if (SGUIDNotEmpty(sguid, rowKey)) {
+									sguidNode.setText(sguid);
+								}
+								
 							} else {
-								createNewSGUIDNode(sguid, node);
+								if (SGUIDNotEmpty(sguid, rowKey)) {
+									createNewSGUIDNode(sguid, node);
+								}
 							}
 						} else {
 							if (needFindByAttributeValue(rowKey)) {
 								node = XMLUtil.findNodeByAttributeValue("rowkey", rowKey, doc);
 								if (node != null) {
-									System.out.println("[Existing]"+oriXPath);
+									System.out.println("[SourceExistInTarget]"+oriXPath);
 									moved++;
 									Element sguidNode = XMLUtil.findChildNode("SGUID", node);
 									if (sguidNode != null) {
@@ -205,21 +288,27 @@ public class Parser {
 										if (isNullAttr != null) {
 											sguidNode.remove(isNullAttr);
 										}
-										sguidNode.setText(sguid);
+										if (SGUIDNotEmpty(sguid, rowKey)) {
+											sguidNode.setText(sguid);
+										}
 									} else {
-										createNewSGUIDNode(sguid, node);
+										if (SGUIDNotEmpty(sguid, rowKey)) {
+											createNewSGUIDNode(sguid, node);
+										}
 									}
 								} else {
-									System.out.println("[Missing]"+oriXPath);
+									System.out.println("[SourceRowKeyMissingInTarget]"+oriXPath);
 									r13missing++;
 								}
 							} else {
-								System.out.println("[Missing]"+oriXPath);
+								System.out.println("[SourceRowKeyMissingInTarget]"+oriXPath);
 								r13missing++;
 							}
 						}
 					} else {
 						String valueSetKey = nodeName + "_1_" + generateValueSet(ele, ignoreColumnList, ignoreConfig.get(vo));
+						//if (valueSetKey.startsWith("Range"))
+						//System.out.println(valueSetKey);
 						if (valueSetMap.containsKey(valueSetKey) && needCompareValueSet) {
 							mapped = true;
 							String sguid = valueSetMap.get(valueSetKey);
@@ -233,9 +322,13 @@ public class Parser {
 									if (isNullAttr != null) {
 										sguidNode.remove(isNullAttr);
 									}
-									sguidNode.setText(sguid);
+									if (SGUIDNotEmpty(sguid, rowKey)) {
+										sguidNode.setText(sguid);
+									}
 								} else {
-									createNewSGUIDNode(sguid, node);
+									if (SGUIDNotEmpty(sguid, rowKey)) {
+										createNewSGUIDNode(sguid, node);
+									}
 								}
 							} else {
 								System.out.println("[Missing][ValueSet]"+oriXPath);
@@ -256,9 +349,13 @@ public class Parser {
 										if (isNullAttr != null) {
 											sguidNode.remove(isNullAttr);
 										}
-										sguidNode.setText(sguid);
+										if (SGUIDNotEmpty(sguid, rowKey)) {
+											sguidNode.setText(sguid);
+										}
 									} else {
-										createNewSGUIDNode(sguid, node);
+										if (SGUIDNotEmpty(sguid, rowKey)) {
+											createNewSGUIDNode(sguid, node);
+										}
 									}
 								} else {
 									System.out.println("[Missing][DateEff]"+oriXPath);
@@ -268,7 +365,7 @@ public class Parser {
 						} 
 					}
 					if (!mapped && !noSGUIDSet.contains(curPath + "/" +  nodeName)) {
-						System.out.println("[NoMappingForTarget]"+newXPath);
+						System.out.println("[TargetRowKeyMissingInSource]"+newXPath);
 					}
 				}
 				if (isDateEffective) {
@@ -281,13 +378,17 @@ public class Parser {
 				recurseCopySGUID(index, ele,curPath + "/" +  nodeName, ignoreColumnList, doc, ignoreConfig);
 			}
 		}
-		XMLWriter writer = new XMLWriter(new FileOutputStream(new File(toFile+".new")));
+		OutputFormat format = new OutputFormat();
+		format.setExpandEmptyElements(true);
+		XMLWriter writer = new XMLWriter(new FileOutputStream(new File(toFile+".new")), format);
+		writer.setEscapeText(needEscape);
         writer.write(doc);
         writer.close();
 	}
 
 	private static boolean needFindByAttributeValue(String rowKey) {
-		return rowKey.contains("\\.") || rowKey.contains("/oldValue") || rowKey.contains("/newValue") || rowKey.contains("http://xmlns") || rowKey.contains("${");
+		return true;
+		//return rowKey.contains("\\.") || rowKey.contains("/oldValue") || rowKey.contains("/newValue") || rowKey.contains("http://xmlns") || rowKey.contains("${");
 	}
 	
 	public static String getXMLNameSpaceFixed(String xpath) {  
@@ -400,7 +501,7 @@ public class Parser {
 					String sguid = xpathMap.get(newXPath);
 					Node node = doc.selectSingleNode(xPath);
 					if (node != null) {
-						System.out.println("[Existing]"+oriXPath);
+						System.out.println("[SourceExistInTarget]"+oriXPath);
 						moved++;
 						Element sguidNode = XMLUtil.findChildNode("SGUID", node);
 						if (sguidNode != null) {
@@ -408,15 +509,19 @@ public class Parser {
 							if (isNullAttr != null) {
 								sguidNode.remove(isNullAttr);
 							}
-							sguidNode.setText(sguid);
+							if (SGUIDNotEmpty(sguid, rowKey)) {
+								sguidNode.setText(sguid);
+							}
 						} else {
-							createNewSGUIDNode(sguid, node);
+							if (SGUIDNotEmpty(sguid, rowKey)) {
+								createNewSGUIDNode(sguid, node);
+							}
 						}
 					} else {
 						if (needFindByAttributeValue(rowKey)) {
 							node = XMLUtil.findNodeByAttributeValue("rowkey", rowKey, doc);
 							if (node != null) {
-								System.out.println("[Existing]"+oriXPath);
+								System.out.println("[SourceExistInTarget]"+oriXPath);
 								moved++;
 								Element sguidNode = XMLUtil.findChildNode("SGUID", node);
 								if (sguidNode != null) {
@@ -424,21 +529,27 @@ public class Parser {
 									if (isNullAttr != null) {
 										sguidNode.remove(isNullAttr);
 									}
-									sguidNode.setText(sguid);
+									if (SGUIDNotEmpty(sguid, rowKey)) {
+										sguidNode.setText(sguid);
+									}
 								} else {
-									createNewSGUIDNode(sguid, node);
+									if (SGUIDNotEmpty(sguid, rowKey)) {
+										createNewSGUIDNode(sguid, node);
+									}
 								}
 							} else {
-								System.out.println("[Missing]"+oriXPath);
+								System.out.println("[SourceRowKeyMissingInTarget]"+oriXPath);
 								r13missing++;
 							}
 						} else {
-							System.out.println("[Missing]"+oriXPath);
+							System.out.println("[SourceRowKeyMissingInTarget]"+oriXPath);
 							r13missing++;
 						}
 					}
 				} else {
 					String valueSetKey = nodeName + "_"+index+"_" + generateValueSet(ele, ignoreColumnList, ignoreConfig.get(nodeName));
+					//if (valueSetKey.startsWith("Range"))
+					//System.out.println(valueSetKey);
 					if (valueSetMap.containsKey(valueSetKey) && needCompareValueSet) {
 						mapped = true;
 						String sguid = valueSetMap.get(valueSetKey);
@@ -452,9 +563,13 @@ public class Parser {
 								if (isNullAttr != null) {
 									sguidNode.remove(isNullAttr);
 								}
-								sguidNode.setText(sguid);
+								if (SGUIDNotEmpty(sguid, rowKey)) {
+									sguidNode.setText(sguid);
+								}
 							} else {
-								createNewSGUIDNode(sguid, node);
+								if (SGUIDNotEmpty(sguid, rowKey)) {
+									createNewSGUIDNode(sguid, node);
+								}
 							}
 						} else {
 							System.out.println("[Missing][ValueSet]"+oriXPath);
@@ -475,9 +590,13 @@ public class Parser {
 									if (isNullAttr != null) {
 										sguidNode.remove(isNullAttr);
 									}
-									sguidNode.setText(sguid);
+									if (SGUIDNotEmpty(sguid, rowKey)) {
+										sguidNode.setText(sguid);
+									}
 								} else {
-									createNewSGUIDNode(sguid, node);
+									if (SGUIDNotEmpty(sguid, rowKey)) {
+										createNewSGUIDNode(sguid, node);
+									}
 								}
 							} else {
 								System.out.println("[Missing][DateEff]"+oriXPath);
@@ -486,7 +605,7 @@ public class Parser {
 						}
 					}
 					if (!mapped && !noSGUIDSet.contains(curPath + "/" +  nodeName)) {
-						System.out.println("[NoMappingForTarget]"+newXPath);
+						System.out.println("[TargetRowKeyMissingInSource]"+newXPath);
 					}
 				}
 				if (isDateEffective) {
@@ -512,6 +631,7 @@ public class Parser {
 	
 	private static String generateValueSet(Element ele, List<String> ignoreElementList, List<String> extIgnoreList) {
 		String key = "";
+		List<String> ls = new ArrayList<String>();
 		List<Element> nodeList = XMLUtil.findAllChildNodes(ele);
 		if (nodeList != null && !nodeList.isEmpty()) {
 			for (Element node : nodeList) {
@@ -519,11 +639,18 @@ public class Parser {
 				if (ignoreElementList.contains(ndName)) {
 					continue;
 				}
+				if (extIgnoreList != null && extIgnoreList.contains(ndName)) {
+					continue;
+				}
 				String ndValue = XMLUtil.getNodeValue(node, true);
-				if (ndValue != null) {
-					key = key + "::" + ndValue;
+				if (ndValue != null && ndValue.length() > 0) {
+					ls.add(ndValue);
 				}
 			}
+		}
+		Collections.sort(ls);
+		for (String ndValue : ls) {
+			key = key + "::" + ndValue;
 		}
 		return key;
 	}
@@ -562,6 +689,48 @@ public class Parser {
 			}
 		}
 	}
+	
+	private static void compareSourceAndTargetSGUID(StringBuffer sb, boolean allowNullInSource, boolean allowNullInTarget, 
+			Map<String, Map<String, String>> hmSource, Map<String, Map<String, String>> hmTarget) {
+		Set<String> allList = mergeKeyMulti(hmSource, hmTarget);
+		if (!allList.isEmpty()) {
+			Iterator<String> allIter = allList.iterator();
+			while(allIter.hasNext()) {
+				String key = allIter.next();
+				if (!hmSource.containsKey(key)) {
+					//sb.append("[rowKeyMissing]"+key + " existing in target but not in source").append(NEW_LINE);
+				} else if (!hmTarget.containsKey(key)) {
+					//sb.append("[rowKeyMissing]"+key + " existing in source but not in target").append(NEW_LINE);
+				} else if (hmSource.containsKey(key) && hmTarget.containsKey(key)) {
+					Map<String, String> sourceMap = hmSource.get(key);
+					Map<String, String> targetMap = hmTarget.get(key);
+					
+					Set<String> subAllList = mergeSubKey(sourceMap, targetMap);
+					Iterator<String> subAllIter = subAllList.iterator();
+					while(subAllIter.hasNext()) {
+						String subKey = subAllIter.next();
+						if (!sourceMap.containsKey(subKey)) {
+							if (subKey.contains("SGUID") && !allowNullInSource) {
+								sb.append("[SGUIDMissing]"+key + "::"+subKey+" existing in target but not in source").append(NEW_LINE);
+							}
+						} else if (!targetMap.containsKey(subKey)) {
+							if (subKey.contains("SGUID") && !allowNullInTarget) {
+								sb.append("[SGUIDMissing]"+key + "::"+subKey+ " existing in source but not in target").append(NEW_LINE);
+							}
+						} else {
+							String sourceValue = sourceMap.get(subKey);
+							String targetValue = targetMap.get(subKey);
+							if (subKey.contains("SGUID")) {
+								if (!sourceValue.equals(targetValue)) {
+									sb.append("[SGUIDDiff]"+key + "::"+subKey+" has different value :: source value::"+sourceValue+"::target value::"+targetValue).append(NEW_LINE);
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
 
 	private static Set<String> mergeSubKey(Map<String, String> sourceMap, Map<String, String> targetMap) {
 		Set<String> set = new HashSet<String>();
@@ -571,6 +740,13 @@ public class Parser {
 	}
 
 	private static Set<String> mergeKey() {
+		Set<String> set = new HashSet<String>();
+		set.addAll(hmSource.keySet());
+		set.addAll(hmTarget.keySet());
+		return set;
+	}
+	
+	private static Set<String> mergeKeyMulti( Map<String, Map<String, String>> hmSource, Map<String, Map<String, String>> hmTarget) {
 		Set<String> set = new HashSet<String>();
 		set.addAll(hmSource.keySet());
 		set.addAll(hmTarget.keySet());
@@ -611,7 +787,6 @@ public class Parser {
 				}
 			}
 		}
-		
 	}
 
 	private static void loadSourceFile(String sourceFile)  throws Exception {
@@ -648,6 +823,79 @@ public class Parser {
 				}
 			}
 		}
+	}
+	
+	private static void loadSourceFile(String sourceFile, Map<String, Map<String, String>> hmSource)  throws Exception {
+		Document doc = XMLUtil.xmlFileToDom(sourceFile);
+		Element root = doc.getRootElement();
+		if (root != null && "SEEDDATA".equalsIgnoreCase(root.getName())) {
+			List<Element> lsElement = XMLUtil.findAllChildNodes(root);
+			if (lsElement != null && !lsElement.isEmpty()) {
+				for (Element ele : lsElement) {
+					String nodeName = ele.getName();
+					String rowKey = XMLUtil.getNodeAttribute(ele, "rowkey");
+					if (rowKey == null || rowKey.length() == 0) {
+						rowKey = "empty::"+UUID.randomUUID();
+					}
+					String key = nodeName + "_1_" + rowKey;
+					Map<String, String> map = new HashMap<String, String>();
+					List<Element> nodeList = XMLUtil.findAllChildNodes(ele);
+					if (nodeList != null && !nodeList.isEmpty()) {
+						for (Element node : nodeList) {
+							String ndName = node.getName();
+							if (ignoreList.contains(ndName)) {
+								continue;
+							}
+							String ndRowKey = XMLUtil.getNodeAttribute(node, "rowkey");
+							if (ndRowKey != null && ndRowKey.length() > 0) {
+								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmSource);
+							} else {
+								String ndValue = XMLUtil.getNodeValue(node, true);
+								map.put(ndName, ndValue);
+							}
+						}
+					}
+					hmSource.put(key, map);
+				}
+			}
+		}
+	}
+	
+	private static void loadTargetFile(String targetFile, Map<String, Map<String, String>> hmTarget) throws Exception {
+		Document doc = XMLUtil.xmlFileToDom(targetFile);
+		Element root = doc.getRootElement();
+		if (root != null && "SEEDDATA".equalsIgnoreCase(root.getName())) {
+			List<Element> lsElement = XMLUtil.findAllChildNodes(root);
+			if (lsElement != null && !lsElement.isEmpty()) {
+				for (Element ele : lsElement) {
+					String nodeName = ele.getName();
+					String rowKey = XMLUtil.getNodeAttribute(ele, "rowkey");
+					if (rowKey == null || rowKey.length() == 0) {
+						rowKey = "empty::"+UUID.randomUUID();
+					}
+					String key = nodeName + "_1_" + rowKey;
+					Map<String, String> map = new HashMap<String, String>();
+					List<Element> nodeList = XMLUtil.findAllChildNodes(ele);
+					if (nodeList != null && !nodeList.isEmpty()) {
+						for (Element node : nodeList) {
+							String ndName = node.getName();
+							if (ignoreList.contains(ndName)) {
+								continue;
+							}
+							String ndRowKey = XMLUtil.getNodeAttribute(node, "rowkey");
+							if (ndRowKey != null && ndRowKey.length() > 0) {
+								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmTarget);
+							} else {
+								String ndValue = XMLUtil.getNodeValue(node, true);
+								map.put(ndName, ndValue);
+							}
+						}
+					}
+					hmTarget.put(key, map);
+				}
+			}
+		}
+		
 	}
 	
 	private static void recurseLoadChildNode(Element ele, int index, String rowKey, String nodeName, Map<String, Map<String, String>> map) {
@@ -832,6 +1080,14 @@ public class Parser {
 
 	private static boolean hasSGUIDNode(Element ele) {
 		return XMLUtil.findChildNode("SGUID", ele) != null;
+	}
+	
+	private static boolean SGUIDNotEmpty(String sguid, String rowKey) {
+		boolean isNotEmpty = (sguid != null && !"".equals(sguid) && sguid.trim().length() > 0);
+		if (!isNotEmpty) {
+			System.out.println("[SourceSGUIDEmptyWarning]rowkey::"+rowKey);
+		}
+		return isNotEmpty;
 	}
 
 	
