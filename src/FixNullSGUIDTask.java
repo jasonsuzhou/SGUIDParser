@@ -21,7 +21,7 @@ public class FixNullSGUIDTask {
 	private static boolean isDateEffective = false;
 	private static String deSGUID = null;
 
-	public static void processTask(String fileName, String dburl) {
+	public static void processTask(String fileName, String dburl, boolean needEscape) {
 		Connection conn = JDBCUtils.getConn(dburl, "fusion", "fusion");
 		BufferedReader br = null;
 		FileReader reader = null;
@@ -80,7 +80,7 @@ public class FixNullSGUIDTask {
 				OutputFormat format = new OutputFormat();
 				format.setExpandEmptyElements(true);
 				XMLWriter writer = new XMLWriter(new FileOutputStream(new File(line + ".fixnull")), format);
-				// writer.setEscapeText(false);
+				writer.setEscapeText(needEscape);
 				writer.write(doc);
 				writer.close();
 

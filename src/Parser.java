@@ -25,6 +25,8 @@ import org.dom4j.io.OutputFormat;
 import org.dom4j.io.SAXReader;
 import org.dom4j.io.XMLWriter;
 
+import com.sun.xml.internal.ws.util.StringUtils;
+
 
 public class Parser {
 	
@@ -115,10 +117,13 @@ public class Parser {
 		    			try {
 		    				Map<String, Map<String, String>> hmSource = new HashMap<String, Map<String, String>>();
 		    				Map<String, Map<String, String>> hmTarget = new HashMap<String, Map<String, String>>();
-							loadSourceFile(sourceFile, hmSource);
-							loadTargetFile(targetFile, hmTarget);
-							compareSourceAndTargetSGUID(sb, allowSource, allowTarget, hmSource, hmTarget);
-			    			if (sb.length() > 0) {
+		    				Map<String, String> hmKeySource = new HashMap<String, String>();
+		    				Map<String, String> hmKeyTarget = new HashMap<String, String>();
+							loadSourceFile(sourceFile, hmSource, hmKeySource);
+							loadTargetFile(targetFile, hmTarget, hmKeyTarget);
+							String result = compareSourceAndTargetSGUID(sb, allowSource, allowTarget, hmSource, hmTarget, hmKeySource);
+							if (sb.length() > 0) {
+								System.out.println(result);
 			    				System.out.println("==============================================================================");
 			    				System.out.println("======source file::"+sourceFile);
 			    				System.out.println("======target file::"+targetFile);
@@ -177,7 +182,13 @@ public class Parser {
 		if ("fixnullsguid".equals(func)) {
 			String fileName = args[1];
 			String dburl = args[2];
-			FixNullSGUIDTask.processTask(fileName, dburl);
+			boolean needEscape = true;
+			if (args.length > 3) {
+				if ("--noescape".equalsIgnoreCase(args[3])) {
+					needEscape = false;
+				}
+			}
+			FixNullSGUIDTask.processTask(fileName, dburl, needEscape);
 		}
 		
 	}
@@ -690,17 +701,76 @@ public class Parser {
 		}
 	}
 	
-	private static void compareSourceAndTargetSGUID(StringBuffer sb, boolean allowNullInSource, boolean allowNullInTarget, 
-			Map<String, Map<String, String>> hmSource, Map<String, Map<String, String>> hmTarget) {
+	private static String compareSourceAndTargetSGUID(StringBuffer sb, boolean allowNullInSource, boolean allowNullInTarget, 
+			Map<String, Map<String, String>> hmSource, Map<String, Map<String, String>> hmTarget, Map<String, String> hmKeySource) {
+		String result = "SUCCESS";
 		Set<String> allList = mergeKeyMulti(hmSource, hmTarget);
 		if (!allList.isEmpty()) {
 			Iterator<String> allIter = allList.iterator();
 			while(allIter.hasNext()) {
 				String key = allIter.next();
-				if (!hmSource.containsKey(key)) {
-					//sb.append("[rowKeyMissing]"+key + " existing in target but not in source").append(NEW_LINE);
-				} else if (!hmTarget.containsKey(key)) {
-					//sb.append("[rowKeyMissing]"+key + " existing in source but not in target").append(NEW_LINE);
+				if (!hmSource.containsKey(key) && hmTarget.containsKey(key)) {
+					if (key.contains(".")) {
+						String[] list = key.split("\\.");
+						Arrays.sort(list);
+						String newKey = generateRowKey(list);
+						String oriKey = hmKeySource.get(newKey);
+						if (oriKey != null) {
+							sb.append("[Warning]target rowkey::"+key+" matching to source rowkey::"+oriKey).append(NEW_LINE);
+							if ("SUCCESS".equals(result)) {
+								result = "WARNING";
+							}
+							Map<String, String> sourceMap = hmSource.get(oriKey);
+							Map<String, String> targetMap = hmTarget.get(key);
+							Set<String> subAllList = mergeSubKey(sourceMap, targetMap);
+							Iterator<String> subAllIter = subAllList.iterator();
+							while(subAllIter.hasNext()) {
+								String subKey = subAllIter.next();
+								if (!sourceMap.containsKey(subKey)) {
+									if (subKey.contains("SGUID") && !allowNullInSource) {
+										sb.append("[SGUIDMissing]"+key + "::"+subKey+" existing in target but not in source").append(NEW_LINE);
+										if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+											result = "FAILED";
+										}
+									}
+								} else if (!targetMap.containsKey(subKey)) {
+									if (subKey.contains("SGUID") && !allowNullInTarget) {
+										sb.append("[SGUIDMissing]"+key + "::"+subKey+ " existing in source but not in target").append(NEW_LINE);
+										if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+											result = "FAILED";
+										}
+									}
+								} else {
+									String sourceValue = sourceMap.get(subKey);
+									String targetValue = targetMap.get(subKey);
+									if (subKey.contains("SGUID")) {
+										if (allowNullInTarget) {
+											if (targetValue != null && !"".equals(targetValue.trim()) && !sourceValue.equals(targetValue)) {
+												sb.append("[SGUIDDiff]"+key + "::"+subKey+" has different value :: source value::"+sourceValue+"::target value::"+targetValue).append(NEW_LINE);
+												if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+													result = "FAILED";
+												}
+											}
+										} else if (allowNullInSource) {
+											if (sourceValue != null && !"".equals(sourceValue.trim()) && !sourceValue.equals(targetValue)) {
+												sb.append("[SGUIDDiff]"+key + "::"+subKey+" has different value :: source value::"+sourceValue+"::target value::"+targetValue).append(NEW_LINE);
+												if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+													result = "FAILED";
+												}
+											}
+										} else {
+											if (!sourceValue.equals(targetValue)) {
+												sb.append("[SGUIDDiff]"+key + "::"+subKey+" has different value :: source value::"+sourceValue+"::target value::"+targetValue).append(NEW_LINE);
+												if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+													result = "FAILED";
+												}
+											}
+										}
+									}
+								}
+							}
+						}
+					}
 				} else if (hmSource.containsKey(key) && hmTarget.containsKey(key)) {
 					Map<String, String> sourceMap = hmSource.get(key);
 					Map<String, String> targetMap = hmTarget.get(key);
@@ -712,24 +782,54 @@ public class Parser {
 						if (!sourceMap.containsKey(subKey)) {
 							if (subKey.contains("SGUID") && !allowNullInSource) {
 								sb.append("[SGUIDMissing]"+key + "::"+subKey+" existing in target but not in source").append(NEW_LINE);
+								if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+									result = "FAILED";
+								}
 							}
 						} else if (!targetMap.containsKey(subKey)) {
 							if (subKey.contains("SGUID") && !allowNullInTarget) {
 								sb.append("[SGUIDMissing]"+key + "::"+subKey+ " existing in source but not in target").append(NEW_LINE);
+								if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+									result = "FAILED";
+								}
 							}
 						} else {
 							String sourceValue = sourceMap.get(subKey);
 							String targetValue = targetMap.get(subKey);
 							if (subKey.contains("SGUID")) {
-								if (!sourceValue.equals(targetValue)) {
-									sb.append("[SGUIDDiff]"+key + "::"+subKey+" has different value :: source value::"+sourceValue+"::target value::"+targetValue).append(NEW_LINE);
+								if (allowNullInTarget) {
+									if (targetValue != null && !"".equals(targetValue.trim()) && !sourceValue.equals(targetValue)) {
+										sb.append("[SGUIDDiff]"+key + "::"+subKey+" has different value :: source value::"+sourceValue+"::target value::"+targetValue).append(NEW_LINE);
+										if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+											result = "FAILED";
+										}
+									}
+								} else if (allowNullInSource) {
+									if (sourceValue != null && !"".equals(sourceValue.trim()) && !sourceValue.equals(targetValue)) {
+										sb.append("[SGUIDDiff]"+key + "::"+subKey+" has different value :: source value::"+sourceValue+"::target value::"+targetValue).append(NEW_LINE);
+										if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+											result = "FAILED";
+										}
+									}
+								} else {
+									if (!sourceValue.equals(targetValue)) {
+										sb.append("[SGUIDDiff]"+key + "::"+subKey+" has different value :: source value::"+sourceValue+"::target value::"+targetValue).append(NEW_LINE);
+										if ("SUCCESS".equals(result) || "WARNING".equals(result)) {
+											result = "FAILED";
+										}
+									}
 								}
 							}
 						}
 					}
+				} else if (!hmSource.containsKey(key)) {
+					//sb.append("[rowKeyMissing]"+key + " existing in target but not in source").append(NEW_LINE);
+				} else if (!hmTarget.containsKey(key)) {
+					//sb.append("[rowKeyMissing]"+key + " existing in source but not in target").append(NEW_LINE);
 				}
 			}
 		}
+		return result;
 	}
 
 	private static Set<String> mergeSubKey(Map<String, String> sourceMap, Map<String, String> targetMap) {
@@ -776,7 +876,7 @@ public class Parser {
 							}
 							String ndRowKey = XMLUtil.getNodeAttribute(node, "rowkey");
 							if (ndRowKey != null && ndRowKey.length() > 0) {
-								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmTarget);
+								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmTarget, null);
 							} else {
 								String ndValue = XMLUtil.getNodeValue(node, true);
 								map.put(ndName, ndValue);
@@ -812,7 +912,7 @@ public class Parser {
 							}
 							String ndRowKey = XMLUtil.getNodeAttribute(node, "rowkey");
 							if (ndRowKey != null && ndRowKey.length() > 0) {
-								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmSource);
+								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmSource, null);
 							} else {
 								String ndValue = XMLUtil.getNodeValue(node, true);
 								map.put(ndName, ndValue);
@@ -825,7 +925,7 @@ public class Parser {
 		}
 	}
 	
-	private static void loadSourceFile(String sourceFile, Map<String, Map<String, String>> hmSource)  throws Exception {
+	private static void loadSourceFile(String sourceFile, Map<String, Map<String, String>> hmSource, Map<String, String> hmKeySource)  throws Exception {
 		Document doc = XMLUtil.xmlFileToDom(sourceFile);
 		Element root = doc.getRootElement();
 		if (root != null && "SEEDDATA".equalsIgnoreCase(root.getName())) {
@@ -848,7 +948,7 @@ public class Parser {
 							}
 							String ndRowKey = XMLUtil.getNodeAttribute(node, "rowkey");
 							if (ndRowKey != null && ndRowKey.length() > 0) {
-								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmSource);
+								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmSource, hmKeySource);
 							} else {
 								String ndValue = XMLUtil.getNodeValue(node, true);
 								map.put(ndName, ndValue);
@@ -856,12 +956,31 @@ public class Parser {
 						}
 					}
 					hmSource.put(key, map);
+					if (key.contains(".")) {
+						String[] list = key.split("\\.");
+						Arrays.sort(list);
+						String newKey = generateRowKey(list);
+						hmKeySource.put(newKey, key);
+					}
 				}
 			}
 		}
 	}
 	
-	private static void loadTargetFile(String targetFile, Map<String, Map<String, String>> hmTarget) throws Exception {
+	private static String generateRowKey(String[] list) {
+		if (list.length > 0) {
+			StringBuffer sb = new StringBuffer();
+			for (String s : list) {
+				sb.append(s).append(".");
+			}
+			String result = sb.toString();
+			return result.substring(0, result.length() -1);
+		} else {
+			return null;
+		}
+	}
+	
+	private static void loadTargetFile(String targetFile, Map<String, Map<String, String>> hmTarget, Map<String, String> hmKeyTarget) throws Exception {
 		Document doc = XMLUtil.xmlFileToDom(targetFile);
 		Element root = doc.getRootElement();
 		if (root != null && "SEEDDATA".equalsIgnoreCase(root.getName())) {
@@ -884,7 +1003,7 @@ public class Parser {
 							}
 							String ndRowKey = XMLUtil.getNodeAttribute(node, "rowkey");
 							if (ndRowKey != null && ndRowKey.length() > 0) {
-								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmTarget);
+								recurseLoadChildNode(node, 1, ndRowKey, ndName, hmTarget, hmKeyTarget);
 							} else {
 								String ndValue = XMLUtil.getNodeValue(node, true);
 								map.put(ndName, ndValue);
@@ -892,13 +1011,19 @@ public class Parser {
 						}
 					}
 					hmTarget.put(key, map);
+					if (key.contains(".")) {
+						String[] list = key.split("\\.");
+						Arrays.sort(list);
+						String newKey = generateRowKey(list);
+						hmKeyTarget.put(newKey, key);
+					}
 				}
 			}
 		}
 		
 	}
 	
-	private static void recurseLoadChildNode(Element ele, int index, String rowKey, String nodeName, Map<String, Map<String, String>> map) {
+	private static void recurseLoadChildNode(Element ele, int index, String rowKey, String nodeName, Map<String, Map<String, String>> map, Map<String, String> hmKeyMap) {
 		index ++;
 		String key = nodeName + "_"+index+"_" + rowKey;
 		Map<String, String> hmValues = new HashMap<String, String>();
@@ -911,7 +1036,7 @@ public class Parser {
 				}
 				String ndRowKey = XMLUtil.getNodeAttribute(node, "rowkey");
 				if (ndRowKey != null && ndRowKey.length() > 0) {
-					recurseLoadChildNode(node, index, ndRowKey, ndName, map);
+					recurseLoadChildNode(node, index, ndRowKey, ndName, map, hmKeyMap);
 				} else {
 					String ndValue = XMLUtil.getNodeValue(node, true);
 					hmValues.put(ndName, ndValue);
@@ -919,6 +1044,12 @@ public class Parser {
 			}
 		}
 		map.put(key, hmValues);
+		if (hmKeyMap != null && key.contains(".")) {
+			String[] list = key.split("\\.");
+			Arrays.sort(list);
+			String newKey = generateRowKey(list);
+			hmKeyMap.put(newKey, key);
+		}
 	}
 
 	private static String getFileName(String filePath) {
