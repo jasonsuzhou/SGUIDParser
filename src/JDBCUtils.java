@@ -87,11 +87,5 @@ public class JDBCUtils {
 		}
 		return null;
 	}
-	
-	public static void main(String[] args) throws Exception {
-		String result = generateSGUID("slcak355.us.oracle.com:1563:ems15942", "fusion", "fusion");
-		System.out.println(result);
-		
-	}
 
 }
